@@ -48,4 +48,8 @@ jar {
 
 Dependancies your plugin requires such as other clouds sdks or similar will be scoped to your plugins classpath. The `PluginManager` creates a new classpath for each plugin loaded. This is done to ensure classes in a plugin do not interfere with Morpheus or other loaded plugins.
 
+### Automated Test Coverage
+
+New PRs against the default branch automatically trigger a Devin AI session that reviews the changes and creates a follow-up PR with E2E test coverage. PRs with `[auto-test]` in the title are excluded to prevent infinite loops.
+
 
