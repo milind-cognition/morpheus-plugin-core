@@ -2,7 +2,7 @@
 
 This library provides a common framework for extending the Morpheus Ops Orchestration Tool. This includes providing plugin extensions for adding various integrations such as Cloud Integrations, Service Level Integrations or Providers for things like DNS, IPAM, Config Management, UI Extensions, Etc.
 
-The plugin architecture requires Morpheus 5 or later.
+The plugin architecture requires Morpheus 5 or later. See the documentation for details.
 
 
 ## Creating a Plugin
