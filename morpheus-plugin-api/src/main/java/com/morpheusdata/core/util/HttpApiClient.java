@@ -91,6 +91,7 @@ import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.Map;
+import java.util.Set;
 import com.fasterxml.jackson.core.type.TypeReference;
 
 /**
@@ -195,6 +196,37 @@ public class HttpApiClient {
 	/**
 	 * Pause the request if a sleep period is required to enforce a throttle rate between API calls.
 	 */
+	private boolean shouldRetry(ServiceResponse response, int attempt, RequestOptions opts) {
+		if (opts == null || opts.maxRetries == null || attempt >= opts.maxRetries) {
+			return false;
+		}
+		Set<Integer> retryableCodes = opts.retryableStatusCodes != null ? opts.retryableStatusCodes : Set.of(429, 502, 503, 504);
+		String errorCode = response.getErrorCode();
+		if (errorCode != null) {
+			try {
+				int code = Integer.parseInt(errorCode);
+				return retryableCodes.contains(code);
+			} catch (NumberFormatException e) {
+				return false;
+			}
+		}
+		// Connection-level failure: errorCode is null, success is false, and errors map contains "error"
+		if (!response.getSuccess() && response.getErrors() != null && response.getErrors().containsKey("error")) {
+			return true;
+		}
+		return false;
+	}
+
+	private void sleepForRetry(int attempt, Long baseBackoffMs) {
+		long delay = Math.min(baseBackoffMs * (long) Math.pow(2, attempt), 30000L);
+		log.warn("Retry backoff: sleeping {}ms before attempt {}", delay, attempt + 1);
+		try {
+			Thread.sleep(delay);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
 	private void sleepIfNecessary() {
 		try {
 			Long tmpThrottleRate = throttleRate;
@@ -234,223 +266,238 @@ public class HttpApiClient {
 	public ServiceResponse callApi(String url, final String path, String username, String password, RequestOptions opts, String method) throws URISyntaxException, Exception {
 		log.debug("Calling Api: {} - {}", url, path);
 		ServiceResponse rtn = new ServiceResponse();
-		LinkedHashMap<String, Object> data = new LinkedHashMap<>();
-		rtn.setData(data);
-		URIBuilder uriBuilder = new URIBuilder(url);
-		try {
+		rtn.setData(new LinkedHashMap<String, Object>());
+		int maxAttempts = (opts != null && opts.maxRetries != null) ? opts.maxRetries + 1 : 1;
+		for (int attempt = 0; attempt < maxAttempts; attempt++) {
+			final ServiceResponse currentRtn = rtn;
+			URIBuilder uriBuilder = new URIBuilder(url);
+			try {
 
-			sleepIfNecessary();
-			lastCallTime = new Date();
+				sleepIfNecessary();
+				lastCallTime = new Date();
 
-			String existingPath = uriBuilder.getPath();
-			// retain path on base url if one exists
-			String newPath = path;
-			if (path != null && path.length() > 0) {
-				if (existingPath != null && existingPath.length() > 0 && !path.startsWith(existingPath)) {
-					if (existingPath.endsWith("/") && path.startsWith("/")) {
-						existingPath = existingPath.substring(0, existingPath.length() - 1);
-					} else if (!existingPath.endsWith("/") && !path.startsWith("/")) {
-						existingPath += "/";
-					}
-					newPath = existingPath + path;
-				}
-				uriBuilder.setPath(newPath);
-			}
-			if (opts.queryParams != null && !opts.queryParams.isEmpty()) {
-				for (CharSequence queryKey : opts.queryParams.keySet()) {
-					uriBuilder.addParameter(queryKey.toString(), opts.queryParams.get(queryKey).toString());
-				}
-			}
-
-			HttpRequestBase request;
-			switch (method) {
-				case "HEAD":
-					request = new HttpHead(uriBuilder.build());
-					break;
-				case "PUT":
-					request = new HttpPut(uriBuilder.build());
-					break;
-				case "POST":
-					request = new HttpPost(uriBuilder.build());
-					break;
-				case "PATCH":
-					request = new HttpPatch(uriBuilder.build());
-					break;
-				case "GET":
-					request = new HttpGet(uriBuilder.build());
-					break;
-				case "DELETE":
-					request = new HttpDelete(uriBuilder.build());
-					break;
-				default:
-					throw new Exception("method was not specified");
-			}
-			if (username != null && username.length() > 0 && password != null && password.length() > 0) {
-				String creds = username + ":" + password;
-				String credHeader = "Basic " + Base64.getEncoder().encodeToString(creds.getBytes());
-				request.addHeader("Authorization", credHeader);
-			}
-
-			//if bearer token
-			if (opts.apiToken != null) {
-				int newLine = opts.apiToken.indexOf('\n');
-				if (newLine > -1)
-					opts.apiToken = opts.apiToken.substring(0, newLine);
-				request.addHeader("Authorization", "Bearer " + opts.apiToken);
-			}
-			//if its oauth signing
-			if (opts.oauth != null) {
-				OauthUtility.signOAuthRequestPlainText(request, opts.oauth.consumerKey, opts.oauth.consumerSecret, opts.oauth.apiKey, opts.oauth.apiSecret, opts);
-			}
-
-			// Headers
-			if (opts.headers == null || opts.headers.isEmpty() || !opts.headers.containsKey("Content-Type")) {
-				request.addHeader("Content-Type", "application/json");
-			}
-
-			if (opts.headers != null && !opts.headers.isEmpty()) {
-				for (CharSequence headerKey : opts.headers.keySet()) {
-					String headerValue = opts.headers.get(headerKey) != null ? opts.headers.get(headerKey).toString() : "";
-					request.addHeader(headerKey.toString(), headerValue);
-				}
-			}
-
-			if (opts.body != null) {
-				HttpEntityEnclosingRequestBase postRequest = (HttpEntityEnclosingRequestBase) request;
-				if (opts.body instanceof Map) {
-					if (opts.contentType == "form") {
-						List<NameValuePair> urlParameters = new ArrayList<NameValuePair>();
-						Map<String, Object> bodyMap = (Map<String, Object>) opts.body;
-						for (String key : bodyMap.keySet()) {
-							Object v = bodyMap.get(key);
-							Object rowValue;
-							if (v instanceof CharSequence) {
-								rowValue = v;
-							} else {
-								rowValue = v.toString();
-							}
-							urlParameters.add(new BasicNameValuePair(key, rowValue.toString()));
+				String existingPath = uriBuilder.getPath();
+				// retain path on base url if one exists
+				String newPath = path;
+				if (path != null && path.length() > 0) {
+					if (existingPath != null && existingPath.length() > 0 && !path.startsWith(existingPath)) {
+						if (existingPath.endsWith("/") && path.startsWith("/")) {
+							existingPath = existingPath.substring(0, existingPath.length() - 1);
+						} else if (!existingPath.endsWith("/") && !path.startsWith("/")) {
+							existingPath += "/";
 						}
-						postRequest.setEntity(new UrlEncodedFormEntity(urlParameters));
-					} else if (opts.contentType == "multi-part-form") {
-						MultipartEntityBuilder entityBuilder = MultipartEntityBuilder.create();
-						String rowBoundary = "--" + java.util.UUID.randomUUID().toString() + "--";
-						Map<String, Object> bodyMap = (Map<String, Object>) opts.body;
-						for (String key : bodyMap.keySet()) {
-							Object v = bodyMap.get(key);
-							//if multiples..
-							if (v instanceof Collection) {
-								for (String rowValue : (Collection<String>) v) {
-									StringBody rowBody = new StringBody(rowValue.toString(), ContentType.create("text/plain", "UTF-8"));
-									entityBuilder.addPart(key, rowBody);
-								}
-							} else {
+						newPath = existingPath + path;
+					}
+					uriBuilder.setPath(newPath);
+				}
+				if (opts.queryParams != null && !opts.queryParams.isEmpty()) {
+					for (CharSequence queryKey : opts.queryParams.keySet()) {
+						uriBuilder.addParameter(queryKey.toString(), opts.queryParams.get(queryKey).toString());
+					}
+				}
+
+				HttpRequestBase request;
+				switch (method) {
+					case "HEAD":
+						request = new HttpHead(uriBuilder.build());
+						break;
+					case "PUT":
+						request = new HttpPut(uriBuilder.build());
+						break;
+					case "POST":
+						request = new HttpPost(uriBuilder.build());
+						break;
+					case "PATCH":
+						request = new HttpPatch(uriBuilder.build());
+						break;
+					case "GET":
+						request = new HttpGet(uriBuilder.build());
+						break;
+					case "DELETE":
+						request = new HttpDelete(uriBuilder.build());
+						break;
+					default:
+						throw new Exception("method was not specified");
+				}
+				if (username != null && username.length() > 0 && password != null && password.length() > 0) {
+					String creds = username + ":" + password;
+					String credHeader = "Basic " + Base64.getEncoder().encodeToString(creds.getBytes());
+					request.addHeader("Authorization", credHeader);
+				}
+
+				//if bearer token
+				if (opts.apiToken != null) {
+					int newLine = opts.apiToken.indexOf('\n');
+					if (newLine > -1)
+						opts.apiToken = opts.apiToken.substring(0, newLine);
+					request.addHeader("Authorization", "Bearer " + opts.apiToken);
+				}
+				//if its oauth signing
+				if (opts.oauth != null) {
+					OauthUtility.signOAuthRequestPlainText(request, opts.oauth.consumerKey, opts.oauth.consumerSecret, opts.oauth.apiKey, opts.oauth.apiSecret, opts);
+				}
+
+				// Headers
+				if (opts.headers == null || opts.headers.isEmpty() || !opts.headers.containsKey("Content-Type")) {
+					request.addHeader("Content-Type", "application/json");
+				}
+
+				if (opts.headers != null && !opts.headers.isEmpty()) {
+					for (CharSequence headerKey : opts.headers.keySet()) {
+						String headerValue = opts.headers.get(headerKey) != null ? opts.headers.get(headerKey).toString() : "";
+						request.addHeader(headerKey.toString(), headerValue);
+					}
+				}
+
+				if (opts.body != null) {
+					HttpEntityEnclosingRequestBase postRequest = (HttpEntityEnclosingRequestBase) request;
+					if (opts.body instanceof Map) {
+						if (opts.contentType == "form") {
+							List<NameValuePair> urlParameters = new ArrayList<NameValuePair>();
+							Map<String, Object> bodyMap = (Map<String, Object>) opts.body;
+							for (String key : bodyMap.keySet()) {
+								Object v = bodyMap.get(key);
 								Object rowValue;
-								//convert it
 								if (v instanceof CharSequence) {
 									rowValue = v;
 								} else {
 									rowValue = v.toString();
 								}
-								StringBody rowBody = new StringBody(rowValue.toString(), ContentType.create("text/plain", "UTF-8"));
-								entityBuilder.addPart(key, rowBody);
+								urlParameters.add(new BasicNameValuePair(key, rowValue.toString()));
 							}
-						}
-						entityBuilder.setContentType(ContentType.MULTIPART_FORM_DATA);
-						entityBuilder.setBoundary(rowBoundary);
-						postRequest.setEntity(entityBuilder.build());
-						//replace the header
-						if (request.containsHeader("Content-Type")) {
-							//append the boundary
-							Header currentType = request.getFirstHeader("Content-Type");
-							String newValue = currentType.getValue();
-							newValue = newValue + "; boundary=" + rowBoundary;
-							request.setHeader("Content-Type", newValue);
-						}
-					} else {
-						ObjectMapper mapper = new ObjectMapper();
-						DateFormat df = new SimpleDateFormat("yyyy-MM-dd'T'hh:mm:ssZ");
-						mapper.setDateFormat(df);
-						mapper.registerModule(new SimpleModule().addSerializer(CharSequence.class, new GStringJsonSerializer()));
-						postRequest.setEntity(new StringEntity(mapper.writeValueAsString(opts.body)));
-					}
-				} else if (opts.body instanceof byte[]) {
-					postRequest.setEntity(new ByteArrayEntity((byte[]) opts.body));
-				} else if (opts.body instanceof InputStream) {
-					postRequest.setEntity(new InputStreamEntity((InputStream) (opts.body), opts.contentLength != null ? opts.contentLength : -1));
-				} else {
-					postRequest.setEntity(new StringEntity(opts.body.toString()));
-				}
-			}
-
-			opts.targetUri = uriBuilder.build();
-			withClient(opts, (HttpClient client, BasicCookieStore cookieStore) -> {
-				CloseableHttpResponse response = null;
-				try {
-
-					response = (CloseableHttpResponse) client.execute(request);
-					if (response.getStatusLine().getStatusCode() <= 399) {
-						for (Header header : response.getAllHeaders()) {
-							rtn.addHeader(header.getName(), header.getValue());
-						}
-
-						if (useCookies) {
-							addCookiesFromResponse(response, request.getURI().getHost(), cookieStore);
-						}
-
-						HttpEntity entity = response.getEntity();
-
-						if (entity != null) {
-							rtn.setContent(EntityUtils.toString(entity));
-							if (!opts.suppressLog) {
-								log.debug("results of SUCCESSFUL call to {}/{}, results: {}", url, path, rtn.getContent());
+							postRequest.setEntity(new UrlEncodedFormEntity(urlParameters));
+						} else if (opts.contentType == "multi-part-form") {
+							MultipartEntityBuilder entityBuilder = MultipartEntityBuilder.create();
+							String rowBoundary = "--" + java.util.UUID.randomUUID().toString() + "--";
+							Map<String, Object> bodyMap = (Map<String, Object>) opts.body;
+							for (String key : bodyMap.keySet()) {
+								Object v = bodyMap.get(key);
+								//if multiples..
+								if (v instanceof Collection) {
+									for (String rowValue : (Collection<String>) v) {
+										StringBody rowBody = new StringBody(rowValue.toString(), ContentType.create("text/plain", "UTF-8"));
+										entityBuilder.addPart(key, rowBody);
+									}
+								} else {
+									Object rowValue;
+									//convert it
+									if (v instanceof CharSequence) {
+										rowValue = v;
+									} else {
+										rowValue = v.toString();
+									}
+									StringBody rowBody = new StringBody(rowValue.toString(), ContentType.create("text/plain", "UTF-8"));
+									entityBuilder.addPart(key, rowBody);
+								}
+							}
+							entityBuilder.setContentType(ContentType.MULTIPART_FORM_DATA);
+							entityBuilder.setBoundary(rowBoundary);
+							postRequest.setEntity(entityBuilder.build());
+							//replace the header
+							if (request.containsHeader("Content-Type")) {
+								//append the boundary
+								Header currentType = request.getFirstHeader("Content-Type");
+								String newValue = currentType.getValue();
+								newValue = newValue + "; boundary=" + rowBoundary;
+								request.setHeader("Content-Type", newValue);
 							}
 						} else {
-							rtn.setContent(null);
+							ObjectMapper mapper = new ObjectMapper();
+							DateFormat df = new SimpleDateFormat("yyyy-MM-dd'T'hh:mm:ssZ");
+							mapper.setDateFormat(df);
+							mapper.registerModule(new SimpleModule().addSerializer(CharSequence.class, new GStringJsonSerializer()));
+							postRequest.setEntity(new StringEntity(mapper.writeValueAsString(opts.body)));
 						}
-
-
-						rtn.setSuccess(true);
-						rtn.setStatusCode(Integer.toString(response.getStatusLine().getStatusCode()));
+					} else if (opts.body instanceof byte[]) {
+						postRequest.setEntity(new ByteArrayEntity((byte[]) opts.body));
+					} else if (opts.body instanceof InputStream) {
+						postRequest.setEntity(new InputStreamEntity((InputStream) (opts.body), opts.contentLength != null ? opts.contentLength : -1));
 					} else {
-						if (response.getEntity() != null) {
-							rtn.setContent(EntityUtils.toString(response.getEntity()));
-						}
-						rtn.setSuccess(false);
-						rtn.setErrorCode(Integer.toString(response.getStatusLine().getStatusCode()));
-						log.warn("path: {} error: {} - {}", path, rtn.getErrorCode(), rtn.getContent());
-					}
-				} catch (Exception ex) {
-					try {
-						log.error("Error occurred processing the response for {} : {}{}", uriBuilder.build().toString(), ex.getMessage(), ex);
-						rtn.setError("Error occurred processing the response for " + uriBuilder.build().toString() + " : " + ex.getMessage());
-					} catch (URISyntaxException uie) {
-						log.error("Error occurred processing the response for {} : {}", "invalid uri", ex.getMessage(), ex);
-						rtn.setError("Error occurred processing the response for invalid uri  : " + ex.getMessage());
-
-					}
-
-					rtn.setSuccess(false);
-				} finally {
-					lastCallTime = new Date();
-					if (response != null) {
-						try {
-							response.close();
-						} catch (IOException ignored) {
-							//ignored exception
-						}
+						postRequest.setEntity(new StringEntity(opts.body.toString()));
 					}
 				}
-			});
 
-		} catch (SSLProtocolException sslEx) {
-			log.error("Error Occurred calling API (SSL Exception): {}", sslEx.getMessage(), sslEx);
-			rtn.addError("sslHandshake", "SSL Handshake Exception (is SNI Misconfigured): " + sslEx.getMessage());
-			rtn.setSuccess(false);
-		} catch (Exception e) {
-			log.error("Error Occurred calling API: " + e.getMessage(), e);
-			rtn.addError("error", e.getMessage());
-			rtn.setSuccess(false);
+				opts.targetUri = uriBuilder.build();
+				withClient(opts, (HttpClient client, BasicCookieStore cookieStore) -> {
+					CloseableHttpResponse response = null;
+					try {
+
+						response = (CloseableHttpResponse) client.execute(request);
+						if (response.getStatusLine().getStatusCode() <= 399) {
+							for (Header header : response.getAllHeaders()) {
+								currentRtn.addHeader(header.getName(), header.getValue());
+							}
+
+							if (useCookies) {
+								addCookiesFromResponse(response, request.getURI().getHost(), cookieStore);
+							}
+
+							HttpEntity entity = response.getEntity();
+
+							if (entity != null) {
+								currentRtn.setContent(EntityUtils.toString(entity));
+								if (!opts.suppressLog) {
+									log.debug("results of SUCCESSFUL call to {}/{}, results: {}", url, path, currentRtn.getContent());
+								}
+							} else {
+								currentRtn.setContent(null);
+							}
+
+
+							currentRtn.setSuccess(true);
+							currentRtn.setStatusCode(Integer.toString(response.getStatusLine().getStatusCode()));
+						} else {
+							if (response.getEntity() != null) {
+								currentRtn.setContent(EntityUtils.toString(response.getEntity()));
+							}
+							currentRtn.setSuccess(false);
+							currentRtn.setErrorCode(Integer.toString(response.getStatusLine().getStatusCode()));
+							log.warn("path: {} error: {} - {}", path, currentRtn.getErrorCode(), currentRtn.getContent());
+						}
+					} catch (Exception ex) {
+						try {
+							log.error("Error occurred processing the response for {} : {}{}", uriBuilder.build().toString(), ex.getMessage(), ex);
+							currentRtn.setError("Error occurred processing the response for " + uriBuilder.build().toString() + " : " + ex.getMessage());
+						} catch (URISyntaxException uie) {
+							log.error("Error occurred processing the response for {} : {}", "invalid uri", ex.getMessage(), ex);
+							currentRtn.setError("Error occurred processing the response for invalid uri  : " + ex.getMessage());
+
+						}
+
+						currentRtn.setSuccess(false);
+					} finally {
+						lastCallTime = new Date();
+						if (response != null) {
+							try {
+								response.close();
+							} catch (IOException ignored) {
+								//ignored exception
+							}
+						}
+					}
+				});
+
+			} catch (SSLProtocolException sslEx) {
+				log.error("Error Occurred calling API (SSL Exception): {}", sslEx.getMessage(), sslEx);
+				currentRtn.addError("sslHandshake", "SSL Handshake Exception (is SNI Misconfigured): " + sslEx.getMessage());
+				currentRtn.setSuccess(false);
+			} catch (Exception e) {
+				log.error("Error Occurred calling API: " + e.getMessage(), e);
+				currentRtn.addError("error", e.getMessage());
+				currentRtn.setSuccess(false);
+			}
+			// Retry logic
+			if (rtn.getSuccess()) {
+				break;
+			}
+			if (shouldRetry(rtn, attempt, opts)) {
+				log.warn("Retrying request to {}/{}, attempt {}/{}, status: {}", url, path, attempt + 1, opts.maxRetries, rtn.getErrorCode());
+				sleepForRetry(attempt, opts.retryBackoffMs);
+				rtn = new ServiceResponse();
+				rtn.setData(new LinkedHashMap<String, Object>());
+			} else {
+				break;
+			}
 		}
 		return rtn;
 	}
@@ -1270,6 +1317,15 @@ public class HttpApiClient {
 		 * KeyStore for client certificate
 		 */
 		public KeyStore clientCertKeyStore;
+
+		/** Maximum number of retry attempts for failed requests. Default 0 (no retries). */
+		public Integer maxRetries = 0;
+
+		/** Initial backoff delay in milliseconds between retries. Doubles on each attempt, capped at 30000ms. Default 1000ms. */
+		public Long retryBackoffMs = 1000L;
+
+		/** HTTP status codes that should trigger a retry. If null, defaults to {429, 502, 503, 504}. */
+		public Set<Integer> retryableStatusCodes = null;
 
 		/**
 		 * Oauth options for signing the request.
