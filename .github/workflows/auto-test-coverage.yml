@@ -1,0 +1,84 @@
+name: Auto E2E Test Coverage
+
+# Triggers on PRs opened or updated against the default branch.
+# Uses a title-based loop guard: PRs with "[auto-test]" in the title are skipped,
+# preventing infinite loops when Devin creates test-coverage PRs.
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - 'v1.2.x'
+
+jobs:
+  trigger-test-coverage:
+    # Skip PRs that were created by this automation (contain [auto-test] in title)
+    # Also skip PRs from devin/* branches as a secondary guard
+    if: >-
+      !contains(github.event.pull_request.title, '[auto-test]') &&
+      !startsWith(github.event.pull_request.head.ref, 'devin/auto-test/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Devin session for E2E test coverage
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          PR_BRANCH="${{ github.event.pull_request.head.ref }}"
+          BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+          REPO="${{ github.repository }}"
+
+          PROMPT=$(cat <<EOF
+          A new PR has been opened on ${REPO}:
+
+          - PR #${PR_NUMBER}: "${PR_TITLE}"
+          - PR URL: ${PR_URL}
+          - Branch: ${PR_BRANCH} -> ${BASE_BRANCH}
+
+          Please review the changes in this PR and add comprehensive E2E test coverage
+          for the new or modified functionality. Follow these guidelines:
+
+          1. Check out the PR branch (${PR_BRANCH}) from ${REPO}.
+          2. Review all changed files to understand what features were added or modified.
+          3. Write E2E tests that cover the new/changed behavior.
+          4. Create a new PR with the test coverage targeting the same base branch (${BASE_BRANCH}).
+          5. IMPORTANT: Include "[auto-test]" in your PR title to prevent triggering this
+             workflow again. Use the format: "[auto-test] Add E2E tests for PR #${PR_NUMBER}"
+          6. Use a branch name starting with "devin/auto-test/" for the test PR.
+          7. Reference the original PR #${PR_NUMBER} in your PR description.
+          EOF
+          )
+
+          echo "Triggering Devin session for PR #${PR_NUMBER}..."
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.devin.ai/v3/organizations/${DEVIN_ORG_ID}/sessions" \
+            -H "Authorization: Bearer ${DEVIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg prompt "$PROMPT" \
+              --arg title "[auto-test] E2E coverage for PR #${PR_NUMBER}" \
+              --arg tag "auto-test-coverage" \
+              '{
+                prompt: $prompt,
+                title: $title,
+                tags: [$tag]
+              }'
+            )")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            SESSION_URL=$(echo "$BODY" | jq -r '.url // empty')
+            SESSION_ID=$(echo "$BODY" | jq -r '.session_id // empty')
+            echo "Devin session created successfully!"
+            echo "  Session ID: ${SESSION_ID}"
+            echo "  Session URL: ${SESSION_URL}"
+          else
+            echo "::error::Failed to create Devin session (HTTP ${HTTP_CODE})"
+            echo "Response: ${BODY}"
+            exit 1
+          fi
