@@ -1,0 +1,105 @@
+name: Auto E2E Test Coverage
+
+# Triggers on PRs opened or updated against the default branch.
+# Uses a title-based loop guard: PRs with "[auto-test]" in the title are
+# skipped, preventing infinite loops when Devin creates test-coverage PRs.
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+      - 'v1.2.x'
+
+# Cancel any in-flight run for the same PR so rapid pushes don't spawn
+# multiple Devin sessions.
+concurrency:
+  group: auto-test-coverage-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  trigger-test-coverage:
+    # Skip PRs that were created by this automation (contain [auto-test] in title)
+    # Also skip PRs from devin/* branches as a secondary guard
+    if: >-
+      !contains(github.event.pull_request.title, '[auto-test]') &&
+      !startsWith(github.event.pull_request.head.ref, 'devin/auto-test/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Devin session for E2E test coverage
+        # All PR metadata is passed via env vars (not inline ${{ }}
+        # expressions) to prevent script injection from crafted PR titles.
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Build the prompt using a quoted heredoc (no shell expansion)
+          # then substitute placeholders safely via parameter expansion.
+          PROMPT=$(cat <<'PROMPT_EOF'
+          A new PR has been opened on __REPO__:
+
+          - PR #__NUM__: "__TITLE__"
+          - PR URL: __URL__
+          - Branch: __BRANCH__ -> __BASE__
+
+          Please review the changes in this PR and add comprehensive E2E
+          test coverage for the new or modified functionality:
+
+          1. Check out the PR branch from the repo.
+          2. Review all changed files to understand what was added/modified.
+          3. Write E2E tests that cover the new/changed behavior.
+          4. Create a new PR with the tests targeting the same base branch.
+          5. IMPORTANT: Include "[auto-test]" in your PR title to prevent
+             re-triggering this workflow. Use the format:
+             "[auto-test] Add E2E tests for PR #__NUM__"
+          6. Use a branch name starting with "devin/auto-test/" for the
+             test PR.
+          7. Reference the original PR in your PR description.
+          PROMPT_EOF
+          )
+
+          # Safely substitute placeholders with actual values
+          PROMPT="${PROMPT//__REPO__/$REPO}"
+          PROMPT="${PROMPT//__NUM__/$PR_NUMBER}"
+          PROMPT="${PROMPT//__TITLE__/$PR_TITLE}"
+          PROMPT="${PROMPT//__URL__/$PR_URL}"
+          PROMPT="${PROMPT//__BRANCH__/$PR_BRANCH}"
+          PROMPT="${PROMPT//__BASE__/$BASE_BRANCH}"
+
+          echo "Triggering Devin session for PR #${PR_NUMBER}..."
+
+          # Build JSON payload safely with jq (handles escaping)
+          PAYLOAD=$(jq -n \
+            --arg prompt "$PROMPT" \
+            --arg title "[auto-test] E2E coverage for PR #${PR_NUMBER}" \
+            --arg tag "auto-test-coverage" \
+            '{
+              prompt: $prompt,
+              title: $title,
+              tags: [$tag]
+            }')
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.devin.ai/v3/organizations/${DEVIN_ORG_ID}/sessions" \
+            -H "Authorization: Bearer ${DEVIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            SESSION_URL=$(echo "$BODY" | jq -r '.url // empty')
+            SESSION_ID=$(echo "$BODY" | jq -r '.session_id // empty')
+            echo "Devin session created successfully!"
+            echo "  Session ID: ${SESSION_ID}"
+            echo "  Session URL: ${SESSION_URL}"
+          else
+            echo "::error::Failed to create Devin session (HTTP ${HTTP_CODE})"
+            echo "Response: ${BODY}"
+            exit 1
+          fi
